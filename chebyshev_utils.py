@@ -17,7 +17,7 @@ import sys
 import ot as pot
 import chaospy
 from torchcfm.conditional_flow_matching import *
-from torchcfm.models.models import *
+#from torchcfm.models.models import *
 from torchcfm.optimal_transport import OTPlanSampler
 import time as timeit
 import ot
