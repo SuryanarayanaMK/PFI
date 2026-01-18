@@ -6,13 +6,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.optim.lr_scheduler import ExponentialLR, MultiStepLR
-from tqdm import tqdm_notebook as tqdm
+from tqdm import tqdm
 import math
 from pinnutils import *
 import sys
-sys.path.insert(0, '/mnt/home/smaddu/anaconda3/lib/python3.9/site-packages')
+# sys.path.insert(0, '/mnt/home/smaddu/anaconda3/lib/python3.9/site-packages')
+# import ot as pot
+#sys.path.insert(0, '/mnt/home/smaddu/.local/lib/python3.9/site-packages/')
+
 import ot as pot
-sys.path.insert(0, '/mnt/home/smaddu/.local/lib/python3.9/site-packages/')
 import chaospy
 from torchcfm.conditional_flow_matching import *
 from torchcfm.models.models import *
@@ -594,6 +596,66 @@ def compute_conditional_distributions_torch_cubic(Dist, batch_size, nodes_fit, n
 
     return Xtrain, ytrain, err
 
+def compute_conditional_distributions_torch_cubic_withgrowth(Dist, batch_size, mass_, nodes_fit, nodes_eval, sigma, err_flag=False, device='cpu'):
+    """
+    Compute conditional distributions using cubic spline interpolation in PyTorch.
+
+    Parameters:
+    - Dist: Tensor of shape [T, B, Ndim] (time × samples × dimensions)
+    - batch_size: Number of trajectories to sample
+    - nodes_fit: Tensor of shape [T], time points for fitting the spline
+    - nodes_eval: Tensor of shape [T], time points for evaluating the spline
+    - sigma: Standard deviation of Gaussian noise added to inputs
+
+    Returns:
+    - Xtrain: Tensor [batch_size * T, Ndim + 2], input points + time and noise dims
+    - ytrain: Tensor [batch_size * T, Ndim], spline derivatives
+    - err: Relative interpolation error
+    """
+    
+    nsamples = Dist.shape[1]
+    Np = nodes_eval.shape[0]
+    Ndim = Dist.shape[2]
+    err = 0;
+
+    Xtrain = torch.zeros((batch_size * Np, Ndim + 2), dtype=torch.float32, device=device)
+    ytrain = torch.zeros((batch_size * Np, Ndim), dtype=torch.float32, device=device)
+
+    # Randomly select batch of trajectories
+    xind = torch.randint(0, nsamples, (batch_size,))
+    Dist = torch.permute(Dist[:, xind, :], (1, 0, 2))  # [B, T, Ndim]
+
+    mass_weight = torch.permute(mass_[:,xind],(1,0))
+
+    # Prepare cubic spline interpolant
+    tempdist = Dist[None, :, :, 0:Ndim]  # [1, B, T, Ndim]
+    coeffs = torchcubicspline.interpolate.natural_cubic_spline_coeffs(nodes_fit, tempdist)
+    spline = torchcubicspline.interpolate.NaturalCubicSpline(coeffs)
+
+    # Evaluate spline and its derivative
+    eval_ = spline.evaluate(nodes_eval)        # [1, B, T, Ndim]
+    derv_ = spline.derivative(nodes_eval)      # [1, B, T, Ndim]
+
+    eval_ = torch.permute(eval_, [2, 1, 0, 3]).squeeze()  # [T, B, Ndim]
+    derv_ = torch.permute(derv_, [2, 1, 0, 3]).squeeze()  # [T, B, Ndim]
+
+    eval_ = torch.permute(eval_, (1, 0, 2))  # [B, T, Ndim]
+    derv_ = torch.permute(derv_, (1, 0, 2))  # [B, T, Ndim]
+
+    # Compute interpolation error
+    if(err_flag):
+        err = torch.mean((eval_ - Dist) ** 2) / torch.mean(Dist ** 2)
+
+    # Create training set with noise-perturbed inputs and spline velocity targets
+    Xtrain[:, Ndim] = 0.01
+    Xtrain[:, Ndim + 1] = nodes_eval.expand(batch_size, -1).reshape(batch_size * Np)
+    
+    mut = eval_.reshape(batch_size * Np, Ndim)
+    Xtrain[:, 0:Ndim] = mut + sigma * torch.randn_like(mut)
+    ytrain[:, 0:Ndim] = derv_.reshape(batch_size * Np, Ndim)
+
+    return Xtrain, ytrain, mass_weight
+
 def P1_vectorized(t_eval, t_fit, y_fit):
     """
     Vectorized linear interpolation and derivative calculation.
@@ -681,6 +743,58 @@ def compute_conditional_distributions_linear(Dist, batch_size, nodes_fit, nodes_
     ytrain[:, 0:Ndim] = dx_interp.view(batch_size * Np, Ndim)
 
     return Xtrain, ytrain, err
+
+def compute_conditional_distributions_linear_withgrowth(Dist, batch_size, mass_, nodes_fit, nodes_eval, reg_, sigma, err_flag=False,device='cuda'):
+    """
+    Compute conditional distributions using Chebyshev polynomial interpolation.
+
+    Parameters:
+    - Dist: Tensor of shape [T, nsamples, Ndim], time × samples × dimensions
+    - batch_size: Number of trajectories to sample
+    - nodes_fit: Tensor of shape [B, T1], time points for fitting (can vary per batch)
+    - nodes_eval: Tensor of shape [B, T2], time points for evaluation (can vary per batch)
+    - reg_: Regularization strength for Chebyshev interpolation
+    - sigma: Standard deviation of Gaussian noise to add to inputs
+    - ot: (Optional) flag for using optimal transport logic (unused here)
+
+    Returns:
+    - Xtrain: [batch_size * T2, Ndim + 2], inputs for training with noise and time appended
+    - ytrain: [batch_size * T2, Ndim], interpolated derivatives
+    - err: Relative interpolation error
+    """
+
+    nsamples = Dist.shape[1]
+    Np = nodes_eval.shape[1]
+    Ndim = Dist.shape[2]
+    err = 0;
+
+    # Initialize output tensors
+    Xtrain = torch.zeros((batch_size * Np, Ndim + 2), dtype=torch.float32, device=device)
+    ytrain = torch.zeros((batch_size * Np, Ndim), dtype=torch.float32, device=device)
+
+    # Select batch of trajectories at random
+    xind = torch.randint(0, nsamples, (batch_size,))
+    Dist = torch.tensor(Dist, dtype=torch.float32, device=device)
+
+    mass_weight = torch.permute(mass_[:,xind],(1,0))
+
+    # Permute and extract [B, T, Ndim]
+    x = torch.permute(Dist[:, xind, 0:Ndim], (1, 0, 2))
+    x_interp, dx_interp = P1_vectorized(nodes_eval, nodes_fit, x)
+
+    # Compute interpolation error (relative MSE)
+    if(err_flag):
+        err = torch.mean((x_interp - x) ** 2) / torch.mean(x ** 2)
+
+    # Construct training set
+    Xtrain[:, Ndim] = 0.01
+    Xtrain[:, Ndim + 1] = nodes_eval.view(batch_size * Np)
+
+    mut = x_interp.view(batch_size * Np, Ndim)
+    Xtrain[:, 0:Ndim] = mut + sigma * torch.randn_like(mut)
+    ytrain[:, 0:Ndim] = dx_interp.view(batch_size * Np, Ndim)
+
+    return Xtrain, ytrain, mass_weight
 
 def select_best_lambda(batch_ot_samples, batch_size, data_batch, eval_batch, Ndim, device, sigma=0.001, 
                        lam_vals=None, rel_tol=0.8, verbose=True):
@@ -958,7 +1072,8 @@ def DSM_training(Ndim, net, X_train, X_data, sigma, nsnaps, nsamples, L, adp_fla
 def generate_noisy_training_data_batch(Dist, Ndim, tp, L, nsamples, nsnaps, device):
     sigma = geometric_sequence(L);
     transform_data = np.zeros((nsnaps,L,nsamples,Ndim+2))
-    for tind in range(0,nsnaps):
+    for tind in tqdm(range(nsnaps), desc="Snapshots"):
+    # for tind in range(0,nsnaps):
         for i in range(0,L):
             for j in range(0,nsamples):
                 mean = Dist[tind,j,0:Ndim]; cov = (sigma[i]**2)*np.eye(Ndim)
@@ -966,7 +1081,7 @@ def generate_noisy_training_data_batch(Dist, Ndim, tp, L, nsamples, nsnaps, devi
                 transform_data[tind,i,j,Ndim] = sigma[i]
                 transform_data[tind,i,j,Ndim+1] = tp[tind]
 
-        print(" done with time ", tind)
+        print(" Done additing noise to Snapshot at time ", tp[tind])
             
     X_train = torch.tensor(transform_data, dtype=torch.float32,requires_grad=True,device=device)
     print(" X_train shape ", X_train.shape)
@@ -1009,7 +1124,8 @@ def DSM_training_batched(Ndim, net, X_train, X_data, sigma, nsnaps, nsamples, L,
     sigma_tensor = torch.tensor(sigma, dtype=torch.float32, device=X_train.device)
     sigma_reshaped = sigma_tensor.view(L, 1, 1)
 
-    for epoch in tqdm(range(int(n_epochs))):
+    pbar = tqdm(range(int(n_epochs)), desc="Score Training")
+    for epoch in pbar:
         for j, (Xbatch, ybatch) in enumerate(loader):
             optimizer.zero_grad()
 
@@ -1048,14 +1164,15 @@ def DSM_training_batched(Ndim, net, X_train, X_data, sigma, nsnaps, nsamples, L,
 
             weight_norm = sum((p**2).sum() for p in net.parameters())
             loss = loss + weight_decay * weight_norm
-
-            if epoch % 250 == 0:
-                print("epoch:", epoch, "c_:", c_)
         
             loss.backward()
             optimizer.step()
             
         scheduler.step()
-        print(f"epoch {epoch+1}/{int(n_epochs)}, loss={loss.item():.10f}, lr={optimizer.param_groups[0]['lr']:.5f}", end="\r")
+        
+        pbar.set_postfix(loss=f"{loss.item():.3e}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+        # occasional logging without breaking tqdm
+        if epoch % 500 == 0:
+            tqdm.write(f"epoch: {epoch} c_: {c_.detach().cpu().numpy()}")
 
     return net
