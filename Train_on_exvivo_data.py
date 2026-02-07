@@ -355,19 +355,6 @@ samples[:,:,0:Ndim] = Dist[:,:,0:Ndim]
 samples[:,:,Ndim]   = 0.01;
 samples[:,:,Ndim+1] = tp[:,None]
 
-###########################################  loading data ######################################## 
-
-if(simflag):
-    drift_net, time_SB, mem_curr_SB, mem_max_SB, acc_SB = train_simulation_based(samples, Ndim, Nf, nsamples, tp, model_params, epsilon, loadp, seed, device);
-    mdic = {
-        'mem_current_SB': mem_curr_SB,
-        'mem_max_SB': mem_max_SB,
-        'time_SB': time_SB,
-        'acc_SB': acc_SB,
-    }
-    savemat("/mnt/ceph/users/smaddu/FMpaper/exvivoHSPC_N"+str(nsamples)+"_Ndim"+str(Ndim)+"_Np"+str(Np)+"_Nf"+str(Nf)+"_fac"+str(fac)+".mat", mdic)
-
-# # #######################################################################################################################
 # # #######################################################################################################################
 
 drift_net_FM_cheb, time_FM_cheb, mem_curr_FM_cheb, mem_max_FM_cheb = train_simulation_free(samples, Ndim, Nf, nsamples, tp, model_params, fac, device, nmb, interp='cheb', dm=dm);
