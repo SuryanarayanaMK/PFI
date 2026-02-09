@@ -22,13 +22,11 @@ for dm in Langevin Mult Additive ODE; do
       --nsamples 6000 \
       --simflag False \
       --seed $seed \
-      --Np 60 \
-      --Nf 60 \
+      --Np 150 \
+      --Nf 150 \
       --dm $dm \
       --spectral_flag True \
-      --geneset_num 2 \
-      --prescient_flag True
+      --geneset_num 7 \
+      --lx 0.7
   done
 done
-
-
